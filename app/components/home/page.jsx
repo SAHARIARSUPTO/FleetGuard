@@ -12,6 +12,7 @@ import {
   BarChart,
   Bar,
 } from "recharts";
+import { useReducer } from "react";
 import {
   TruckIcon,
   BellAlertIcon,
@@ -27,6 +28,7 @@ import {
   ArrowPathIcon,
   ExclamationCircleIcon,
 } from "@heroicons/react/24/solid";
+import { CheckCircleIcon } from "@heroicons/react/24/outline";
 
 // --- FIX 1: LEAFLET CSS & DYNAMIC IMPORTS ---
 import "leaflet/dist/leaflet.css";
@@ -102,16 +104,16 @@ const processFleetData = (rawData) => {
     const dateObj = new Date(record.timestamp * 1000);
 
     // LATCHING LOGIC:
-    // If an alert happened in the last 60 seconds relative to the data, keep it RED.
+    // If an alert happened in the last 5 minutes (300 seconds) relative to the data, keep it RED.
     const lastAlert = lastAlertTimes[record.vehicleId] || 0;
     const secondsSinceAlert = latestSystemTimestamp - lastAlert;
 
-    // It is drowsy if the Current Record is Alert OR if an alert happened < 60s ago
+    // It is drowsy if the Current Record is Alert OR if an alert happened < 300s ago
     const isDrowsy =
       record.alert === true ||
       record.alert === "Sleeping" ||
       record.alert === "true" ||
-      secondsSinceAlert < 60;
+      secondsSinceAlert < 300;
 
     vehicleMap.set(record.vehicleId, {
       ...record,
@@ -219,6 +221,20 @@ export default function Dashboard() {
   const [data, setData] = useState([]);
   const [isClient, setIsClient] = useState(false);
   const [notification, setNotification] = useState(null);
+  const [acknowledged, dispatch] = useReducer((state, action) => {
+    switch (action.type) {
+      case "ACKNOWLEDGE":
+        // Acknowledge a vehicle for 5 minutes
+        return { ...state, [action.vehicleId]: Date.now() + 5 * 60 * 1000 };
+      case "CLEANUP":
+        // Remove expired acknowledgements
+        return Object.fromEntries(
+          Object.entries(state).filter(([_, expiry]) => expiry > Date.now())
+        );
+      default:
+        return state;
+    }
+  }, {});
 
   // --- CONTROL SIMULATION ---
   const showNotification = (msg, type = "info") => {
@@ -276,6 +292,13 @@ export default function Dashboard() {
 
     fetchData();
     const interval = setInterval(fetchData, 1000); // Faster polling
+    const ackCleanupInterval = setInterval(() => {
+      dispatch({ type: "CLEANUP" });
+    }, 5000); // Cleanup expired acks every 5 seconds
+    return () => {
+      clearInterval(interval);
+      clearInterval(ackCleanupInterval);
+    };
     return () => clearInterval(interval);
   }, []);
 
@@ -335,8 +358,8 @@ export default function Dashboard() {
             {/* Active Alert Banner in Header */}
             {stats.drowsinessCount > 0 && (
               <div className="bg-red-600 text-white px-4 py-1 rounded-full text-xs font-bold animate-pulse flex items-center gap-2 shadow-red-200 shadow-lg">
-                <ExclamationCircleIcon className="w-4 h-4" />
-                DANGER: DROWSINESS DETECTED
+                <ExclamationCircleIcon className="w-4 h-4" /> DANGER:{" "}
+                {stats.drowsinessCount} DRIVER(S) DROWSY
               </div>
             )}
             <div className="text-right hidden sm:block">
@@ -353,7 +376,7 @@ export default function Dashboard() {
         {/* --- KPI CARDS --- */}
         <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
           <StatCard
-            title="Active Alerts (60s)"
+            title="Active Alerts (5min)"
             value={stats.drowsinessCount || 0}
             unit="Drivers"
             icon={MoonIcon}
@@ -516,8 +539,10 @@ export default function Dashboard() {
                   <div
                     key={v._id}
                     className={`p-3 rounded-xl border transition-all duration-300 ${
-                      v.isDrowsy
+                      v.isDrowsy && !acknowledged[v.vehicleId]
                         ? "bg-red-50 border-red-200 shadow-sm ring-2 ring-red-100"
+                        : v.isDrowsy && acknowledged[v.vehicleId]
+                        ? "bg-orange-50 border-orange-200"
                         : "bg-white border-slate-100 hover:border-blue-300"
                     }`}
                   >
@@ -531,9 +556,15 @@ export default function Dashboard() {
                         </p>
                       </div>
                       {v.isDrowsy ? (
-                        <span className="animate-pulse bg-red-600 text-white text-[10px] font-bold px-2 py-1 rounded-full shadow-lg shadow-red-300">
-                          DROWSY
-                        </span>
+                        v.isDrowsy && !acknowledged[v.vehicleId] ? (
+                          <span className="animate-pulse bg-red-600 text-white text-[10px] font-bold px-2 py-1 rounded-full shadow-lg shadow-red-300">
+                            DROWSY
+                          </span>
+                        ) : (
+                          <span className="bg-orange-100 text-orange-600 text-[10px] font-bold px-2 py-1 rounded-full flex items-center gap-1">
+                            <CheckCircleIcon className="w-3 h-3" /> ACKNOWLEDGED
+                          </span>
+                        )
                       ) : (
                         <span className="bg-emerald-100 text-emerald-700 text-[10px] font-bold px-2 py-1 rounded-full">
                           ACTIVE
@@ -541,43 +572,67 @@ export default function Dashboard() {
                       )}
                     </div>
 
-                    <div className="flex items-center justify-between text-xs text-slate-600 mt-2 bg-white/50 p-2 rounded-lg">
+                    <div className="flex items-center justify-between text-xs text-slate-600 mt-2 bg-white/50 p-2 rounded-lg border border-slate-100">
                       <div className="flex items-center gap-1">
                         <ClockIcon className="w-3 h-3 text-slate-400" />
                         {v.formattedTime}
                       </div>
+                      {v.isDrowsy && (
+                        <div className="font-mono text-red-600 font-bold">
+                          {`Alert ~${Math.round(
+                            v.secondsSinceAlert / 60
+                          )}m ago`}
+                        </div>
+                      )}
                       <div className="font-mono font-bold">{v.speed} km/h</div>
                     </div>
 
                     {/* CONTROL ACTION BAR */}
-                    <div className="grid grid-cols-4 gap-2 mt-3">
-                      <button
-                        onClick={() =>
-                          handleVehicleControl("CALL", v.vehicleId)
-                        }
-                        className="col-span-2 bg-slate-800 hover:bg-slate-900 text-white rounded text-[10px] font-bold py-1.5 flex items-center justify-center gap-1"
-                        title="Call Driver"
-                      >
-                        <PhoneIcon className="w-3 h-3" /> CONTACT
-                      </button>
-                      <button
-                        onClick={() =>
-                          handleVehicleControl("TRIGGER_ALARM", v.vehicleId)
-                        }
-                        className="col-span-1 bg-orange-100 hover:bg-orange-200 text-orange-700 rounded text-[10px] font-bold flex items-center justify-center"
-                        title="Trigger Siren"
-                      >
-                        <SpeakerWaveIcon className="w-3 h-3" />
-                      </button>
-                      <button
-                        onClick={() =>
-                          handleVehicleControl("KILL_ENGINE", v.vehicleId)
-                        }
-                        className="col-span-1 bg-red-100 hover:bg-red-200 text-red-700 rounded text-[10px] font-bold flex items-center justify-center"
-                        title="Emergency Stop"
-                      >
-                        <PowerIcon className="w-3 h-3" />
-                      </button>
+                    <div className="grid grid-cols-5 gap-2 mt-3">
+                      {v.isDrowsy && !acknowledged[v.vehicleId] ? (
+                        <button
+                          onClick={() =>
+                            dispatch({
+                              type: "ACKNOWLEDGE",
+                              vehicleId: v.vehicleId,
+                            })
+                          }
+                          className="col-span-2 bg-green-100 hover:bg-green-200 text-green-800 rounded text-[10px] font-bold py-1.5 flex items-center justify-center gap-1"
+                          title="Acknowledge Alert"
+                        >
+                          <CheckCircleIcon className="w-3 h-3" /> ACK
+                        </button>
+                      ) : (
+                        <button
+                          onClick={() =>
+                            handleVehicleControl("CALL", v.vehicleId)
+                          }
+                          className="col-span-2 bg-slate-800 hover:bg-slate-900 text-white rounded text-[10px] font-bold py-1.5 flex items-center justify-center gap-1"
+                          title="Call Driver"
+                        >
+                          <PhoneIcon className="w-3 h-3" /> CONTACT
+                        </button>
+                      )}
+                      <div className="col-span-3 grid grid-cols-2 gap-2">
+                        <button
+                          onClick={() =>
+                            handleVehicleControl("TRIGGER_ALARM", v.vehicleId)
+                          }
+                          className="bg-orange-100 hover:bg-orange-200 text-orange-700 rounded text-[10px] font-bold flex items-center justify-center"
+                          title="Trigger Siren"
+                        >
+                          <SpeakerWaveIcon className="w-3 h-3" />
+                        </button>
+                        <button
+                          onClick={() =>
+                            handleVehicleControl("KILL_ENGINE", v.vehicleId)
+                          }
+                          className="bg-red-100 hover:bg-red-200 text-red-700 rounded text-[10px] font-bold flex items-center justify-center"
+                          title="Emergency Stop"
+                        >
+                          <PowerIcon className="w-3 h-3" />
+                        </button>
+                      </div>
                     </div>
                   </div>
                 ))}

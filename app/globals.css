@@ -1,7 +1,6 @@
-@tailwind base;
-@tailwind components;
-@tailwind utilities;
-
-body {
-  /* You can add global body styles here if needed */
+@import "tailwindcss";
+.leaflet-container {
+  height: 100%;
+  width: 100%;
+  border-radius: 1rem;
 }

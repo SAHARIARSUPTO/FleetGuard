@@ -13,8 +13,8 @@ SEND_INTERVAL_SECONDS = 5
 VEHICLE_ID = "BUS12"
 DRIVER_ID = "DRV007"
 DRIVER_NAME = "Karimul Driver"
-API_URL = "http://localhost:3000/api/data"
-SIREN_API_URL = "http://localhost:3000/api/siren"
+API_URL = "http://fleetguard-six.vercel.app/api/data"
+SIREN_API_URL = "http://fleetguard-six.vercel.app/api/siren"
 
 # Siren settings
 SIREN_DURATION = 10  # seconds siren stays ON
