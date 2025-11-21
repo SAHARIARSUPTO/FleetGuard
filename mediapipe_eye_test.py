@@ -7,83 +7,89 @@ import threading
 import json
 
 # ---------- SETTINGS ----------
-ARDUINO_PORT = 'COM3' 
+ARDUINO_PORT = 'COM3'
 ARDUINO_BAUD = 115200
-SEND_INTERVAL_SECONDS = 5 
+
+SEND_INTERVAL_SECONDS = 5
 VEHICLE_ID = "BUS12"
 DRIVER_ID = "DRV007"
 DRIVER_NAME = "Karimul Driver"
-API_URL = "http://fleetguard-six.vercel.app/api/data"
-SIREN_API_URL = "http://fleetguard-six.vercel.app/api/siren"
 
-# Siren settings
-SIREN_DURATION = 10  # seconds siren stays ON
-processed_commands = set()  # track which commands have been handled
+API_URL = "https://fleetguard-six.vercel.app/api/data"
+SIREN_API_URL = "https://fleetguard-six.vercel.app/api/siren"
+
+SIREN_DURATION = 10
+processed_commands = set()
 
 # EAR SETTINGS
 EYE_AR_THRESH = 0.25
-EYE_AR_CONSEC_FRAMES = 20 
+EYE_AR_CONSEC_FRAMES = 20
+
 LEFT_EYE = [33, 160, 158, 133, 153, 144]
 RIGHT_EYE = [362, 385, 387, 263, 373, 380]
 
-# ---------- GLOBALS ----------
+# ---------- GLOBAL STATE ----------
 blink_counter = 0
 eye_closed_time = 0
 is_drowsy = False
+
 SPEED = 0
-GPS = {"lat": 23.8103, "lng": 90.4125} 
+GPS = {"lat": 24.879915, "lng": 88.271300}
+
 gps_lock = threading.Lock()
 arduino = None
+siren_off_timer = None
 
-# ---------- INITIALIZE ARDUINO ----------
+# ---------- ARDUINO INIT ----------
 try:
     arduino = serial.Serial(ARDUINO_PORT, ARDUINO_BAUD, timeout=1)
     time.sleep(2)
     print("[INIT] Arduino Connected")
 except:
-    print("[INIT] Arduino NOT found. Simulation Mode.")
+    print("[INIT] Arduino NOT found. Running in Simulation Mode.")
 
-# ---------- HELPER FUNCTIONS ----------
+# ---------- SAFE SERIAL ----------
 def safe_serial_write(data):
-    if arduino:
-        try: arduino.write(data)
-        except: pass
+    try:
+        if arduino:
+            arduino.write(data)
+    except:
+        pass
 
+# ---------- SEND DATA ----------
 def send_data(alert_status, speed, gps_data):
     payload = {
         "vehicleId": VEHICLE_ID,
         "speed": speed,
         "gps": gps_data,
-        "alert": alert_status, 
-        "driver": { "id": DRIVER_ID, "name": DRIVER_NAME },
+        "alert": alert_status,
+        "driver": {"id": DRIVER_ID, "name": DRIVER_NAME},
         "timestamp": time.time()
     }
-    
-    def post_request():
+
+    def post_data():
         try:
             requests.post(API_URL, json=payload, timeout=2)
             print(f"[DATA SENT] Alert: {alert_status}")
         except Exception as e:
             print(f"[ERR] API Fail: {e}")
 
-    threading.Thread(target=post_request).start()
+    threading.Thread(target=post_data).start()
 
+# ---------- EAR CALC ----------
 def get_eye_aspect_ratio(landmarks, eye_indices):
-    p1 = landmarks[eye_indices[0]]
-    p2 = landmarks[eye_indices[1]]
-    p3 = landmarks[eye_indices[2]]
-    p4 = landmarks[eye_indices[3]]
-    p5 = landmarks[eye_indices[4]]
-    p6 = landmarks[eye_indices[5]]
-    A = ((p2.x - p6.x)**2 + (p2.y - p6.y)**2)**0.5
-    B = ((p3.x - p5.x)**2 + (p3.y - p5.y)**2)**0.5
-    C = ((p1.x - p4.x)**2 + (p1.y - p4.y)**2)**0.5
+    p = [landmarks[i] for i in eye_indices]
+    A = ((p[1].x - p[5].x)**2 + (p[1].y - p[5].y)**2)**0.5
+    B = ((p[2].x - p[4].x)**2 + (p[2].y - p[4].y)**2)**0.5
+    C = ((p[0].x - p[3].x)**2 + (p[0].y - p[3].y)**2)**0.5
     return (A + B) / (2.0 * C)
 
-# ---------- GPS READER THREAD ----------
+# ---------- READ GPS ----------
 def read_gps_from_arduino():
     global GPS
-    if not arduino: return
+    if not arduino:
+        return
+
     while True:
         try:
             if arduino.in_waiting > 0:
@@ -91,51 +97,83 @@ def read_gps_from_arduino():
                 if line.startswith("{") and line.endswith("}"):
                     data = json.loads(line)
                     with gps_lock:
-                        GPS['lat'] = data.get('lat', GPS['lat'])
-                        GPS['lng'] = data.get('lng', GPS['lng'])
+                        GPS.update({
+                            "lat": data.get("lat", GPS["lat"]),
+                            "lng": data.get("lng", GPS["lng"])
+                        })
         except:
             pass
         time.sleep(0.1)
 
-gps_thread = threading.Thread(target=read_gps_from_arduino, daemon=True)
-gps_thread.start()
+threading.Thread(target=read_gps_from_arduino, daemon=True).start()
 
-# ---------- POLL SIREN API WITH DEBOUNCE ----------
+# ---------- SIREN COMMAND POLLER ----------
 def poll_siren_api():
-    global processed_commands
+    global siren_off_timer, is_drowsy
+
     while True:
         try:
             res = requests.get(SIREN_API_URL, timeout=2)
-            data = res.json()
-            now = time.time()
+            cmds = res.json()
 
-            for cmd in data:
-                vid = cmd.get("vehicleId")
-                cid = cmd.get("id")  # unique id of the command in DB
-                action = cmd.get("command")
+            for cmd in cmds:
+                cid = cmd["_id"]
+                vid = cmd["vehicleId"]
+                action = cmd["command"]
+                ts = cmd.get("timestamp", 0)
 
-                if vid == VEHICLE_ID and cid not in processed_commands:
-                    processed_commands.add(cid)
+                # ------- FILTERS ----------
+                if vid != VEHICLE_ID:
+                    continue
 
-                    if action == "TRIGGER_ALARM":
-                        print("[SIREN] Triggering Alarm")
-                        safe_serial_write(b'B')
-                        # stop siren after duration
-                        threading.Timer(SIREN_DURATION, lambda: safe_serial_write(b'S')).start()
+                if cmd.get("status") != "PENDING":
+                    continue
 
-                    elif action == "KILL_ENGINE":
-                        print("[SIREN] Kill Engine")
-                        safe_serial_write(b'K')
+                # ignore old commands (>5 sec)
+                if time.time() - ts > 5:
+                    continue
 
-                    elif action == "RESET":
-                        print("[SIREN] Reset")
+                if cid in processed_commands:
+                    continue
+
+                processed_commands.add(cid)
+                print(f"[SIREN] New Command: {action}")
+
+                # cancel old timer
+                if siren_off_timer and siren_off_timer.is_alive():
+                    siren_off_timer.cancel()
+
+                # ------- ACTIONS ----------
+                if action == "TRIGGER_ALARM":
+                    print("[SIREN] Alarm Triggered!")
+                    safe_serial_write(b'B')
+
+                    def auto_reset_alarm():
                         safe_serial_write(b'S')
-                        global is_drowsy
-                        is_drowsy = False
+                        print("[SIREN] Alarm Auto Reset -> S sent")
+
+                    siren_off_timer = threading.Timer(SIREN_DURATION, auto_reset_alarm)
+                    siren_off_timer.start()
+
+                elif action == "KILL_ENGINE":
+                    print("[SIREN] Engine Kill ACTIVATED!")
+                    safe_serial_write(b'K')
+
+                    # auto reset after 1 sec
+                    def auto_reset_engine():
+                        safe_serial_write(b'S')
+                        print("[SIREN] Engine Auto Reset -> S sent")
+
+                    threading.Timer(1, auto_reset_engine).start()
+
+                elif action == "RESET":
+                    print("[SIREN] RESET COMMAND")
+                    safe_serial_write(b'S')
+                    is_drowsy = False
 
             time.sleep(1)
-        except Exception as e:
-            # Timeout or connection errors
+
+        except Exception:
             time.sleep(1)
 
 threading.Thread(target=poll_siren_api, daemon=True).start()
@@ -143,59 +181,63 @@ threading.Thread(target=poll_siren_api, daemon=True).start()
 # ---------- MAIN LOOP ----------
 mp_face_mesh = mp.solutions.face_mesh
 face_mesh = mp_face_mesh.FaceMesh(max_num_faces=1, refine_landmarks=True)
+
 cap = cv2.VideoCapture(0)
 last_send_time = time.time()
+
 print("[MAIN] FleetGuard AI running...")
 
 while True:
     ret, frame = cap.read()
-    if not ret: break
+    if not ret:
+        break
 
     frame = cv2.flip(frame, 1)
-    rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-    results = face_mesh.process(rgb_frame)
-    
-    SPEED = 50 
+    rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    results = face_mesh.process(rgb)
 
-    # --- DROWSINESS LOGIC ---
+    SPEED = 50
+
+    # ---------- DROWSINESS ----------
     if results.multi_face_landmarks:
         lm = results.multi_face_landmarks[0].landmark
-        left_ear = get_eye_aspect_ratio(lm, LEFT_EYE)
-        right_ear = get_eye_aspect_ratio(lm, RIGHT_EYE)
-        avg_ear = (left_ear + right_ear) / 2.0
+        
+        L = get_eye_aspect_ratio(lm, LEFT_EYE)
+        R = get_eye_aspect_ratio(lm, RIGHT_EYE)
+        EAR = (L + R) / 2
 
-        if avg_ear < EYE_AR_THRESH:
+        if EAR < EYE_AR_THRESH:
             eye_closed_time += 1
         else:
             eye_closed_time = 0
-            if is_drowsy: 
+            if is_drowsy:
                 is_drowsy = False
                 safe_serial_write(b'S')
-                with gps_lock: gps_copy = dict(GPS)
-                send_data(False, SPEED, gps_copy)
+                with gps_lock:
+                    send_data(False, SPEED, dict(GPS))
 
-        if eye_closed_time > EYE_AR_CONSEC_FRAMES:
-            if not is_drowsy:
-                is_drowsy = True
-                safe_serial_write(b'A')
-                with gps_lock: gps_copy = dict(GPS)
-                send_data("Sleeping", SPEED, gps_copy)
+        if eye_closed_time > EYE_AR_CONSEC_FRAMES and not is_drowsy:
+            is_drowsy = True
+            safe_serial_write(b'A')
+            with gps_lock:
+                send_data("Sleeping", SPEED, dict(GPS))
 
-        # Draw UI on Frame
-        color = (0, 0, 255) if is_drowsy else (0, 255, 0)
-        cv2.putText(frame, f"EAR: {avg_ear:.2f}", (30, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, color, 2)
+        cv2.putText(frame, f"EAR: {EAR:.2f}", (30, 50),
+                    cv2.FONT_HERSHEY_SIMPLEX, 1, (0,0,255) if is_drowsy else (0,255,0), 2)
+
         if is_drowsy:
-            cv2.putText(frame, "DROWSINESS ALERT!", (100, 300), cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 0, 255), 3)
+            cv2.putText(frame, "DROWSINESS ALERT!", (100, 300),
+                        cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0,0,255), 3)
 
-    # --- HEARTBEAT ---
+    # ---------- HEARTBEAT ----------
     if time.time() - last_send_time > SEND_INTERVAL_SECONDS:
-        with gps_lock: gps_copy = dict(GPS)
-        payload_alert = "Sleeping" if is_drowsy else False
-        send_data(payload_alert, SPEED, gps_copy)
+        with gps_lock:
+            send_data("Sleeping" if is_drowsy else False, SPEED, dict(GPS))
         last_send_time = time.time()
 
     cv2.imshow("FleetGuard AI", frame)
-    if cv2.waitKey(1) & 0xFF == 27: break
+    if cv2.waitKey(1) & 0xFF == 27:
+        break
 
 cap.release()
 cv2.destroyAllWindows()

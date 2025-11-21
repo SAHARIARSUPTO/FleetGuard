@@ -28,6 +28,8 @@ import {
   ArrowPathIcon,
   ExclamationCircleIcon,
 } from "@heroicons/react/24/solid";
+import { ListBulletIcon, ChartPieIcon } from "@heroicons/react/24/outline";
+
 import { CheckCircleIcon } from "@heroicons/react/24/outline";
 
 // --- FIX 1: LEAFLET CSS & DYNAMIC IMPORTS ---
@@ -60,8 +62,8 @@ const getIcon = (isDrowsy) => {
   if (!L) return null;
   // Use a Red Truck icon if drowsy, otherwise standard
   const iconUrl = isDrowsy
-    ? "https://cdn-icons-png.flaticon.com/512/743/743922.png" // Can replace with a red icon URL if you have one
-    : "https://cdn-icons-png.flaticon.com/512/743/743922.png";
+    ? "/images/bus-stop.png" // Drowsy Icon
+    : "/images/bus-stop.png"; // Normal Icon
 
   return new L.Icon({
     iconUrl: iconUrl,
@@ -101,7 +103,7 @@ const processFleetData = (rawData) => {
 
   // Second Pass: Build Vehicle State with LATCHING logic
   sortedData.forEach((record) => {
-    const dateObj = new Date(record.timestamp * 1000);
+    const dateObj = new Date(Math.floor(record.timestamp) * 1000);
 
     // LATCHING LOGIC:
     // If an alert happened in the last 5 minutes (300 seconds) relative to the data, keep it RED.
@@ -221,6 +223,9 @@ export default function Dashboard() {
   const [data, setData] = useState([]);
   const [isClient, setIsClient] = useState(false);
   const [notification, setNotification] = useState(null);
+  const [currentTime, setCurrentTime] = useState("");
+  const [sirenLog, setSirenLog] = useState([]);
+  const [activeTab, setActiveTab] = useState("vehicles");
   const [acknowledged, dispatch] = useReducer((state, action) => {
     switch (action.type) {
       case "ACKNOWLEDGE":
@@ -244,38 +249,37 @@ export default function Dashboard() {
 
   const handleVehicleControl = async (action, vehicleId) => {
     let msg = "";
+    try {
+      const response = await fetch("/api/siren", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          vehicleId,
+          timestamp: Math.floor(Date.now() / 1000),
+          command: action, // Use the action directly
+        }),
+      });
+      if (!response.ok) throw new Error(`Failed to send ${action} command.`);
+    } catch (error) {
+      console.error("Control API Error:", error);
+      showNotification(`Error sending ${action} command.`, "danger");
+      return; // Stop if the API call fails
+    }
+
     switch (action) {
       case "KILL_ENGINE":
         msg = `🛑 COMMAND SENT: Cutting Engine Power for ${vehicleId}...`;
         break;
       case "TRIGGER_ALARM":
         msg = `📢 COMMAND SENT: Triggering Remote Siren for ${vehicleId}...`;
-        try {
-          const response = await fetch("/api/siren", {
-            method: "POST",
-            headers: {
-              "Content-Type": "application/json",
-            },
-            body: JSON.stringify({
-              vehicleId,
-              timestamp: Math.floor(Date.now() / 1000),
-              command: "TRIGGER_ALARM",
-            }),
-          });
-          if (!response.ok) throw new Error("Failed to log siren command.");
-        } catch (error) {
-          console.error("Siren API Error:", error);
-        }
-        msg = `📢 COMMAND SENT: Triggering Remote Siren for ${vehicleId}...`;
         break;
       case "RESET":
         msg = `🔄 SYSTEM: Resetting Sensors for ${vehicleId}...`;
         break;
-      case "CALL":
-        msg = `📞 DIALING: Connecting to Driver of ${vehicleId}...`;
-        break;
       default:
-        msg = "Command Sent";
+        msg = `Command ${action} sent to ${vehicleId}.`;
     }
     showNotification(msg, action === "KILL_ENGINE" ? "danger" : "info");
   };
@@ -287,11 +291,19 @@ export default function Dashboard() {
       fetch("/api/data")
         .then((res) => res.json())
         .then((json) => setData(json))
-        .catch((e) => console.error(e));
+        .catch((e) => console.error("Failed to fetch vehicle data:", e));
+    };
+    const fetchSirenLog = () => {
+      fetch("/api/siren")
+        .then((res) => res.json())
+        .then((json) => setSirenLog(json))
+        .catch((e) => console.error("Failed to fetch siren log:", e));
     };
 
     fetchData();
+    fetchSirenLog();
     const interval = setInterval(fetchData, 1000); // Faster polling
+    const sirenInterval = setInterval(fetchSirenLog, 5000); // Poll siren log every 5s
     const ackCleanupInterval = setInterval(() => {
       dispatch({ type: "CLEANUP" });
     }, 5000); // Cleanup expired acks every 5 seconds
@@ -300,8 +312,19 @@ export default function Dashboard() {
       clearInterval(ackCleanupInterval);
     };
     return () => clearInterval(interval);
+    return () => {
+      clearInterval(interval);
+      clearInterval(sirenInterval);
+    };
   }, []);
 
+  // Client-side effect to update time and prevent hydration mismatch
+  useEffect(() => {
+    const timer = setInterval(() => {
+      setCurrentTime(new Date().toLocaleTimeString());
+    }, 1000);
+    return () => clearInterval(timer);
+  }, []);
   const { stats, uniqueVehicles, history } = useMemo(
     () => processFleetData(data),
     [data]
@@ -313,10 +336,31 @@ export default function Dashboard() {
     return { normal: getIcon(false), drowsy: getIcon(true) };
   }, [isClient]); // Re-run this memo only when isClient becomes true
 
-  const mapCenter = [23.8909, 89.115]; // Default center
+  const mapProps = useMemo(() => {
+    const validVehicles = uniqueVehicles.filter(
+      (v) => v.gps && v.gps.lat !== 0 && v.gps.lng !== 0
+    );
+
+    if (validVehicles.length === 0) {
+      return { center: [23.8909, 89.115], zoom: 7 }; // Default view
+    }
+
+    const latitudes = validVehicles.map((v) => v.gps.lat);
+    const longitudes = validVehicles.map((v) => v.gps.lng);
+
+    const bounds = [
+      [Math.min(...latitudes), Math.min(...longitudes)],
+      [Math.max(...latitudes), Math.max(...longitudes)],
+    ];
+
+    return {
+      bounds: bounds,
+      boundsOptions: { padding: [50, 50] }, // Add 50px padding around the bounds
+    };
+  }, [uniqueVehicles]);
 
   return (
-    <div className="min-h-screen bg-slate-50 text-slate-800 font-sans pb-10">
+    <div className="min-h-screen bg-slate-100 text-slate-800 font-sans pb-10">
       {/* --- NOTIFICATION TOAST --- */}
       <AnimatePresence>
         {notification && (
@@ -339,10 +383,10 @@ export default function Dashboard() {
       </AnimatePresence>
 
       {/* --- HEADER --- */}
-      <header className="bg-white border-b border-slate-200 sticky top-0 z-30 backdrop-blur-md bg-opacity-90">
+      <header className="bg-white/80 border-b border-slate-200 sticky top-0 z-30 backdrop-blur-lg">
         <div className="max-w-7xl mx-auto px-4 sm:px-6 h-16 flex items-center justify-between">
           <div className="flex items-center gap-3">
-            <div className="bg-slate-900 p-2 rounded-lg">
+            <div className="bg-blue-600 p-2 rounded-lg shadow-md shadow-blue-500/20">
               <TruckIcon className="h-5 w-5 text-white" />
             </div>
             <div>
@@ -357,16 +401,14 @@ export default function Dashboard() {
           <div className="flex items-center gap-4">
             {/* Active Alert Banner in Header */}
             {stats.drowsinessCount > 0 && (
-              <div className="bg-red-600 text-white px-4 py-1 rounded-full text-xs font-bold animate-pulse flex items-center gap-2 shadow-red-200 shadow-lg">
+              <div className="bg-red-600 text-white px-4 py-1.5 rounded-full text-xs font-bold animate-pulse flex items-center gap-2 shadow-lg shadow-red-500/30">
                 <ExclamationCircleIcon className="w-4 h-4" /> DANGER:{" "}
                 {stats.drowsinessCount} DRIVER(S) DROWSY
               </div>
             )}
             <div className="text-right hidden sm:block">
-              <p className="text-xs font-bold text-slate-400">SYSTEM TIME</p>
-              <p className="text-sm font-mono text-slate-700">
-                {new Date().toLocaleTimeString()}
-              </p>
+              <p className="text-xs font-bold text-slate-500">SYSTEM TIME</p>
+              <p className="text-sm font-mono text-slate-700">{currentTime}</p>
             </div>
           </div>
         </div>
@@ -374,7 +416,7 @@ export default function Dashboard() {
 
       <main className="max-w-7xl mx-auto px-4 sm:px-6 mt-6 space-y-6">
         {/* --- KPI CARDS --- */}
-        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
+        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-5">
           <StatCard
             title="Active Alerts (5min)"
             value={stats.drowsinessCount || 0}
@@ -413,7 +455,7 @@ export default function Dashboard() {
         {/* --- DASHBOARD CONTENT --- */}
         <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 h-[700px] lg:h-[600px]">
           {/* LEFT: MAP (8 cols) */}
-          <div className="lg:col-span-8 bg-white rounded-2xl shadow-sm border border-slate-200 flex flex-col overflow-hidden relative">
+          <div className="lg:col-span-8 bg-white rounded-2xl shadow-lg shadow-slate-200/70 border border-slate-200 flex flex-col overflow-hidden relative">
             <div className="absolute top-4 left-4 z-[400] bg-white/95 backdrop-blur px-4 py-2 rounded-lg shadow-md border-l-4 border-blue-600">
               <h2 className="text-sm font-bold text-slate-800 flex items-center gap-2">
                 <MapPinIcon className="w-4 h-4 text-blue-600" /> Live GPS
@@ -424,9 +466,7 @@ export default function Dashboard() {
             <div className="flex-1 w-full h-full bg-slate-100 relative z-0">
               {isClient && (
                 <MapContainer
-                  center={mapCenter}
-                  zoom={13} // Zoomed in slightly
-                  scrollWheelZoom={true}
+                  {...mapProps}
                   style={{ height: "100%", width: "100%" }}
                 >
                   <TileLayer
@@ -525,162 +565,253 @@ export default function Dashboard() {
 
           {/* RIGHT: LIST & CHART (4 cols) */}
           <div className="lg:col-span-4 flex flex-col gap-6 h-full">
-            {/* Vehicle Status List */}
-            <div className="bg-white rounded-2xl shadow-sm border border-slate-200 flex-1 flex flex-col overflow-hidden">
-              <div className="p-4 border-b border-slate-100 bg-slate-50 flex justify-between items-center">
-                <h3 className="font-bold text-slate-700">Vehicle Controls</h3>
-                <span className="text-xs font-mono bg-white px-2 py-1 rounded border text-slate-500">
-                  {stats.totalVehicles} Connected
-                </span>
-              </div>
-
-              <div className="overflow-y-auto p-4 space-y-3 flex-1 custom-scrollbar">
-                {uniqueVehicles.map((v) => (
-                  <div
-                    key={v._id}
-                    className={`p-3 rounded-xl border transition-all duration-300 ${
-                      v.isDrowsy && !acknowledged[v.vehicleId]
-                        ? "bg-red-50 border-red-200 shadow-sm ring-2 ring-red-100"
-                        : v.isDrowsy && acknowledged[v.vehicleId]
-                        ? "bg-orange-50 border-orange-200"
-                        : "bg-white border-slate-100 hover:border-blue-300"
+            <div className="bg-white rounded-2xl shadow-lg shadow-slate-200/70 border border-slate-200 flex-1 flex flex-col overflow-hidden">
+              {/* TABS */}
+              <div className="p-2 border-b border-slate-200 bg-slate-50 flex justify-between items-center">
+                <div className="flex items-center gap-2">
+                  <button
+                    onClick={() => setActiveTab("vehicles")}
+                    className={`flex items-center gap-2 px-3 py-1.5 rounded-md text-sm font-bold transition-colors ${
+                      activeTab === "vehicles"
+                        ? "bg-white text-blue-600 shadow-sm"
+                        : "text-slate-500 hover:bg-slate-200"
                     }`}
                   >
-                    <div className="flex justify-between items-start mb-2">
-                      <div>
-                        <h4 className="font-bold text-slate-800">
-                          {v.vehicleId}
-                        </h4>
-                        <p className="text-xs text-slate-500 flex items-center gap-1">
-                          <UserIcon className="w-3 h-3" /> {v.driver?.name}
+                    <TruckIcon className="w-4 h-4" />
+                    Vehicles
+                  </button>
+                  <button
+                    onClick={() => setActiveTab("log")}
+                    className={`flex items-center gap-2 px-3 py-1.5 rounded-md text-sm font-bold transition-colors ${
+                      activeTab === "log"
+                        ? "bg-white text-blue-600 shadow-sm"
+                        : "text-slate-500 hover:bg-slate-200"
+                    }`}
+                  >
+                    <ListBulletIcon className="w-4 h-4" />
+                    Command Log
+                  </button>
+                  <button
+                    onClick={() => setActiveTab("analytics")}
+                    className={`flex items-center gap-2 px-3 py-1.5 rounded-md text-sm font-bold transition-colors ${
+                      activeTab === "analytics"
+                        ? "bg-white text-blue-600 shadow-sm"
+                        : "text-slate-500 hover:bg-slate-200"
+                    }`}
+                  >
+                    <ChartPieIcon className="w-4 h-4" />
+                    Analytics
+                  </button>
+                </div>
+              </div>
+
+              {/* TAB CONTENT */}
+              {activeTab === "vehicles" && (
+                <div className="overflow-y-auto p-4 space-y-3 flex-1 custom-scrollbar">
+                  {uniqueVehicles.map((v) => (
+                    <div
+                      key={v._id}
+                      className={`p-3 rounded-xl border transition-all duration-300 ${
+                        v.isDrowsy && !acknowledged[v.vehicleId]
+                          ? "bg-red-50 border-red-200 shadow-sm ring-2 ring-red-100"
+                          : v.isDrowsy && acknowledged[v.vehicleId]
+                          ? "bg-orange-50 border-orange-200"
+                          : "bg-white border-slate-100 hover:border-blue-300"
+                      }`}
+                    >
+                      <div className="flex justify-between items-start mb-2">
+                        <div>
+                          <h4 className="font-bold text-slate-800">
+                            {v.vehicleId}
+                          </h4>
+                          <p className="text-xs text-slate-500 flex items-center gap-1">
+                            <UserIcon className="w-3 h-3" /> {v.driver?.name}
+                          </p>
+                        </div>
+                        {v.isDrowsy ? (
+                          v.isDrowsy && !acknowledged[v.vehicleId] ? (
+                            <span className="animate-pulse bg-red-600 text-white text-[10px] font-bold px-2 py-1 rounded-full shadow-lg shadow-red-300">
+                              DROWSY
+                            </span>
+                          ) : (
+                            <span className="bg-orange-100 text-orange-600 text-[10px] font-bold px-2 py-1 rounded-full flex items-center gap-1">
+                              <CheckCircleIcon className="w-3 h-3" />{" "}
+                              ACKNOWLEDGED
+                            </span>
+                          )
+                        ) : (
+                          <span className="bg-emerald-100 text-emerald-700 text-[10px] font-bold px-2 py-1 rounded-full">
+                            ACTIVE
+                          </span>
+                        )}
+                      </div>
+
+                      <div className="flex items-center justify-between text-xs text-slate-600 mt-2 bg-white/50 p-2 rounded-lg border border-slate-100">
+                        <div className="flex items-center gap-1">
+                          <ClockIcon className="w-3 h-3 text-slate-400" />
+                          {v.formattedTime}
+                        </div>
+                        {v.isDrowsy && (
+                          <div className="font-mono text-red-600 font-bold">
+                            {`Alert ~${Math.round(
+                              v.secondsSinceAlert / 60
+                            )}m ago`}
+                          </div>
+                        )}
+                        <div className="font-mono font-bold">
+                          {v.speed} km/h
+                        </div>
+                      </div>
+
+                      {/* CONTROL ACTION BAR */}
+                      <div className="grid grid-cols-5 gap-2 mt-3">
+                        {v.isDrowsy && !acknowledged[v.vehicleId] ? (
+                          <button
+                            onClick={() =>
+                              dispatch({
+                                type: "ACKNOWLEDGE",
+                                vehicleId: v.vehicleId,
+                              })
+                            }
+                            className="col-span-2 bg-green-100 hover:bg-green-200 text-green-800 rounded text-[10px] font-bold py-1.5 flex items-center justify-center gap-1"
+                            title="Acknowledge Alert"
+                          >
+                            <CheckCircleIcon className="w-3 h-3" /> ACK
+                          </button>
+                        ) : (
+                          <button
+                            onClick={() =>
+                              handleVehicleControl("CALL", v.vehicleId)
+                            }
+                            className="col-span-2 bg-slate-800 hover:bg-slate-900 text-white rounded text-[10px] font-bold py-1.5 flex items-center justify-center gap-1"
+                            title="Call Driver"
+                          >
+                            <PhoneIcon className="w-3 h-3" /> CONTACT
+                          </button>
+                        )}
+                        <div className="col-span-3 grid grid-cols-2 gap-2">
+                          <button
+                            onClick={() =>
+                              handleVehicleControl("TRIGGER_ALARM", v.vehicleId)
+                            }
+                            className="bg-orange-100 hover:bg-orange-200 text-orange-700 rounded text-[10px] font-bold flex items-center justify-center"
+                            title="Trigger Siren"
+                          >
+                            <SpeakerWaveIcon className="w-3 h-3" />
+                          </button>
+                          <button
+                            onClick={() =>
+                              handleVehicleControl("KILL_ENGINE", v.vehicleId)
+                            }
+                            className="bg-red-100 hover:bg-red-200 text-red-700 rounded text-[10px] font-bold flex items-center justify-center"
+                            title="Emergency Stop"
+                          >
+                            <PowerIcon className="w-3 h-3" />
+                          </button>
+                        </div>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )}
+
+              {activeTab === "log" && (
+                <div className="overflow-y-auto p-4 space-y-3 flex-1 custom-scrollbar">
+                  {sirenLog.map((log) => (
+                    <div
+                      key={log._id}
+                      className="flex items-center gap-3 text-xs p-2 rounded-lg bg-slate-50 border border-slate-100"
+                    >
+                      <div
+                        className={`w-8 h-8 rounded-lg flex items-center justify-center ${
+                          log.command === "KILL_ENGINE"
+                            ? "bg-red-100 text-red-600"
+                            : "bg-orange-100 text-orange-600"
+                        }`}
+                      >
+                        {log.command === "KILL_ENGINE" ? (
+                          <PowerIcon className="w-4 h-4" />
+                        ) : (
+                          <SpeakerWaveIcon className="w-4 h-4" />
+                        )}
+                      </div>
+                      <div className="flex-1">
+                        <p className="font-bold text-slate-700">
+                          {log.command.replace("_", " ")}
+                        </p>
+                        <p className="text-slate-500">
+                          To{" "}
+                          <span className="font-medium">{log.vehicleId}</span>
                         </p>
                       </div>
-                      {v.isDrowsy ? (
-                        v.isDrowsy && !acknowledged[v.vehicleId] ? (
-                          <span className="animate-pulse bg-red-600 text-white text-[10px] font-bold px-2 py-1 rounded-full shadow-lg shadow-red-300">
-                            DROWSY
-                          </span>
-                        ) : (
-                          <span className="bg-orange-100 text-orange-600 text-[10px] font-bold px-2 py-1 rounded-full flex items-center gap-1">
-                            <CheckCircleIcon className="w-3 h-3" /> ACKNOWLEDGED
-                          </span>
-                        )
-                      ) : (
-                        <span className="bg-emerald-100 text-emerald-700 text-[10px] font-bold px-2 py-1 rounded-full">
-                          ACTIVE
-                        </span>
-                      )}
-                    </div>
-
-                    <div className="flex items-center justify-between text-xs text-slate-600 mt-2 bg-white/50 p-2 rounded-lg border border-slate-100">
-                      <div className="flex items-center gap-1">
-                        <ClockIcon className="w-3 h-3 text-slate-400" />
-                        {v.formattedTime}
-                      </div>
-                      {v.isDrowsy && (
-                        <div className="font-mono text-red-600 font-bold">
-                          {`Alert ~${Math.round(
-                            v.secondsSinceAlert / 60
-                          )}m ago`}
-                        </div>
-                      )}
-                      <div className="font-mono font-bold">{v.speed} km/h</div>
-                    </div>
-
-                    {/* CONTROL ACTION BAR */}
-                    <div className="grid grid-cols-5 gap-2 mt-3">
-                      {v.isDrowsy && !acknowledged[v.vehicleId] ? (
-                        <button
-                          onClick={() =>
-                            dispatch({
-                              type: "ACKNOWLEDGE",
-                              vehicleId: v.vehicleId,
-                            })
-                          }
-                          className="col-span-2 bg-green-100 hover:bg-green-200 text-green-800 rounded text-[10px] font-bold py-1.5 flex items-center justify-center gap-1"
-                          title="Acknowledge Alert"
+                      <div className="text-right">
+                        <p className="font-mono text-slate-500">
+                          {new Date(
+                            Math.floor(log.timestamp) * 1000
+                          ).toLocaleTimeString()}
+                        </p>
+                        <p
+                          className={`font-bold ${
+                            log.status === "PENDING"
+                              ? "text-yellow-600"
+                              : "text-green-600"
+                          }`}
                         >
-                          <CheckCircleIcon className="w-3 h-3" /> ACK
-                        </button>
-                      ) : (
-                        <button
-                          onClick={() =>
-                            handleVehicleControl("CALL", v.vehicleId)
-                          }
-                          className="col-span-2 bg-slate-800 hover:bg-slate-900 text-white rounded text-[10px] font-bold py-1.5 flex items-center justify-center gap-1"
-                          title="Call Driver"
-                        >
-                          <PhoneIcon className="w-3 h-3" /> CONTACT
-                        </button>
-                      )}
-                      <div className="col-span-3 grid grid-cols-2 gap-2">
-                        <button
-                          onClick={() =>
-                            handleVehicleControl("TRIGGER_ALARM", v.vehicleId)
-                          }
-                          className="bg-orange-100 hover:bg-orange-200 text-orange-700 rounded text-[10px] font-bold flex items-center justify-center"
-                          title="Trigger Siren"
-                        >
-                          <SpeakerWaveIcon className="w-3 h-3" />
-                        </button>
-                        <button
-                          onClick={() =>
-                            handleVehicleControl("KILL_ENGINE", v.vehicleId)
-                          }
-                          className="bg-red-100 hover:bg-red-200 text-red-700 rounded text-[10px] font-bold flex items-center justify-center"
-                          title="Emergency Stop"
-                        >
-                          <PowerIcon className="w-3 h-3" />
-                        </button>
+                          {log.status}
+                        </p>
                       </div>
                     </div>
+                  ))}
+                </div>
+              )}
+
+              {activeTab === "analytics" && (
+                <div className="p-4 flex flex-col flex-1">
+                  <h3 className="text-xs font-bold text-slate-400 uppercase mb-2">
+                    Speed Trend & Alerts
+                  </h3>
+                  <div className="flex-1 w-full min-h-0">
+                    <ResponsiveContainer width="100%" height="100%">
+                      <AreaChart data={history}>
+                        <defs>
+                          <linearGradient
+                            id="colorSpeed"
+                            x1="0"
+                            y1="0"
+                            x2="0"
+                            y2="1"
+                          >
+                            <stop
+                              offset="5%"
+                              stopColor="#3b82f6"
+                              stopOpacity={0.2}
+                            />
+                            <stop
+                              offset="95%"
+                              stopColor="#3b82f6"
+                              stopOpacity={0}
+                            />
+                          </linearGradient>
+                        </defs>
+                        <XAxis dataKey="time" hide />
+                        <Tooltip
+                          contentStyle={{
+                            borderRadius: "8px",
+                            fontSize: "12px",
+                          }}
+                        />
+                        <Area
+                          type="monotone"
+                          dataKey="speed"
+                          stroke="#3b82f6"
+                          strokeWidth={2}
+                          fill="url(#colorSpeed)"
+                        />
+                      </AreaChart>
+                    </ResponsiveContainer>
                   </div>
-                ))}
-              </div>
-            </div>
-
-            {/* Mini Chart */}
-            <div className="bg-white rounded-2xl shadow-sm border border-slate-200 h-48 p-4 flex flex-col">
-              <h3 className="text-xs font-bold text-slate-400 uppercase mb-2">
-                Speed Trend & Alerts
-              </h3>
-              <div className="flex-1 w-full min-h-0">
-                <ResponsiveContainer width="100%" height="100%">
-                  <AreaChart data={history}>
-                    <defs>
-                      <linearGradient
-                        id="colorSpeed"
-                        x1="0"
-                        y1="0"
-                        x2="0"
-                        y2="1"
-                      >
-                        <stop
-                          offset="5%"
-                          stopColor="#3b82f6"
-                          stopOpacity={0.2}
-                        />
-                        <stop
-                          offset="95%"
-                          stopColor="#3b82f6"
-                          stopOpacity={0}
-                        />
-                      </linearGradient>
-                    </defs>
-                    <XAxis dataKey="time" hide />
-                    <Tooltip
-                      contentStyle={{ borderRadius: "8px", fontSize: "12px" }}
-                    />
-                    <Area
-                      type="monotone"
-                      dataKey="speed"
-                      stroke="#3b82f6"
-                      strokeWidth={2}
-                      fill="url(#colorSpeed)"
-                    />
-                  </AreaChart>
-                </ResponsiveContainer>
-              </div>
+                </div>
+              )}
             </div>
           </div>
         </div>
@@ -720,6 +851,31 @@ export default function Dashboard() {
             box-shadow: 0 0 0 0 rgba(220, 38, 38, 0);
           }
         }
+        @keyframes shake {
+          0%,
+          100% {
+            transform: translateX(0);
+          }
+          10%,
+          30%,
+          50%,
+          70%,
+          90% {
+            transform: translateX(-5px);
+          }
+          20%,
+          40%,
+          60%,
+          80% {
+            transform: translateX(5px);
+          }
+        }
+
+        .leaflet-marker-shaking {
+          animation: shake 0.82s cubic-bezier(0.36, 0.07, 0.19, 0.97) both;
+          transform: translate3d(0, 0, 0);
+        }
+
         .leaflet-marker-drowsy {
           animation: pulse-red 1.5s infinite;
           border-radius: 50%;
