@@ -221,6 +221,7 @@ const StatCard = ({
 // --- MAIN COMPONENT ---
 export default function Dashboard() {
   const [data, setData] = useState([]);
+  const [gpsData, setGpsData] = useState([]);
   const [isClient, setIsClient] = useState(false);
   const [notification, setNotification] = useState(null);
   const [currentTime, setCurrentTime] = useState("");
@@ -299,24 +300,37 @@ export default function Dashboard() {
         .then((json) => setSirenLog(json))
         .catch((e) => console.error("Failed to fetch siren log:", e));
     };
+    const fetchGpsData = () => {
+      fetch("/api/updatedgps")
+        .then((res) => res.json())
+        .then((json) => setGpsData(json))
+        .catch((e) => console.error("Failed to fetch GPS data:", e));
+    };
 
     fetchData();
     fetchSirenLog();
+    fetchGpsData();
     const interval = setInterval(fetchData, 1000); // Faster polling
+    const gpsInterval = setInterval(fetchGpsData, 1000); // Poll GPS data
     const sirenInterval = setInterval(fetchSirenLog, 5000); // Poll siren log every 5s
     const ackCleanupInterval = setInterval(() => {
       dispatch({ type: "CLEANUP" });
     }, 5000); // Cleanup expired acks every 5 seconds
+
     return () => {
       clearInterval(interval);
+      clearInterval(gpsInterval);
+      clearInterval(sirenInterval);
       clearInterval(ackCleanupInterval);
     };
-    return () => clearInterval(interval);
-    return () => {
-      clearInterval(interval);
-      clearInterval(sirenInterval);
-    };
   }, []);
+
+  const mergedData = useMemo(() => {
+    const gpsMap = new Map(gpsData.map((item) => [item.vehicleId, item.gps]));
+    return data.map((item) =>
+      gpsMap.has(item.vehicleId) ? { ...item, gps: gpsMap.get(item.vehicleId) } : item
+    );
+  }, [data, gpsData]);
 
   // Client-side effect to update time and prevent hydration mismatch
   useEffect(() => {
@@ -326,8 +340,8 @@ export default function Dashboard() {
     return () => clearInterval(timer);
   }, []);
   const { stats, uniqueVehicles, history } = useMemo(
-    () => processFleetData(data),
-    [data]
+    () => processFleetData(mergedData),
+    [mergedData]
   );
 
   // Memoize icons to prevent flickering

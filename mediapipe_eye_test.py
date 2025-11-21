@@ -9,22 +9,19 @@ import json
 # ---------- SETTINGS ----------
 ARDUINO_PORT = 'COM3'
 ARDUINO_BAUD = 115200
-
 SEND_INTERVAL_SECONDS = 5
 VEHICLE_ID = "BUS12"
 DRIVER_ID = "DRV007"
 DRIVER_NAME = "Karimul Driver"
 
-API_URL = "https://fleetguard-six.vercel.app/api/data"
-SIREN_API_URL = "https://fleetguard-six.vercel.app/api/siren"
-
+API_URL = "https://fleet-guard-theta.vercel.app/api/data"
+GPS_UPDATE_API_URL = "https://fleet-guard-theta.vercel.app/api/updatedgps"
+SIREN_API_URL = "https://fleet-guard-theta.vercel.app/api/siren"
 SIREN_DURATION = 10
-processed_commands = set()
 
 # EAR SETTINGS
 EYE_AR_THRESH = 0.25
 EYE_AR_CONSEC_FRAMES = 20
-
 LEFT_EYE = [33, 160, 158, 133, 153, 144]
 RIGHT_EYE = [362, 385, 387, 263, 373, 380]
 
@@ -32,13 +29,14 @@ RIGHT_EYE = [362, 385, 387, 263, 373, 380]
 blink_counter = 0
 eye_closed_time = 0
 is_drowsy = False
-
 SPEED = 0
 GPS = {"lat": 24.879915, "lng": 88.271300}
-
 gps_lock = threading.Lock()
 arduino = None
 siren_off_timer = None
+processed_commands = set()
+siren_initialized = False
+last_gps_sent = {"lat": None, "lng": None}
 
 # ---------- ARDUINO INIT ----------
 try:
@@ -56,6 +54,24 @@ def safe_serial_write(data):
     except:
         pass
 
+# ---------- API CALLS ----------
+def safe_post(url, payload, retries=3, timeout=10):
+    for _ in range(retries):
+        try:
+            requests.post(url, json=payload, timeout=timeout)
+            return True
+        except:
+            time.sleep(1)
+    return False
+
+def safe_get(url, retries=3, timeout=10):
+    for _ in range(retries):
+        try:
+            return requests.get(url, timeout=timeout)
+        except:
+            time.sleep(1)
+    return None
+
 # ---------- SEND DATA ----------
 def send_data(alert_status, speed, gps_data):
     payload = {
@@ -66,15 +82,25 @@ def send_data(alert_status, speed, gps_data):
         "driver": {"id": DRIVER_ID, "name": DRIVER_NAME},
         "timestamp": time.time()
     }
+    threading.Thread(target=lambda: safe_post(API_URL, payload), daemon=True).start()
+    print(f"[DATA SENT] Alert: {alert_status}, GPS: {gps_data}")
 
-    def post_data():
-        try:
-            requests.post(API_URL, json=payload, timeout=2)
-            print(f"[DATA SENT] Alert: {alert_status}")
-        except Exception as e:
-            print(f"[ERR] API Fail: {e}")
-
-    threading.Thread(target=post_data).start()
+# ---------- SEND GPS ON CHANGE ----------
+def send_gps_updates():
+    global last_gps_sent
+    while True:
+        with gps_lock:
+            lat, lng = GPS["lat"], GPS["lng"]
+        if (lat, lng) != (last_gps_sent["lat"], last_gps_sent["lng"]):
+            last_gps_sent["lat"], last_gps_sent["lng"] = lat, lng
+            payload = {
+                "vehicleId": VEHICLE_ID,
+                "gps": {"lat": lat, "lng": lng},
+                "timestamp": time.time()
+            }
+            threading.Thread(target=lambda: safe_post(GPS_UPDATE_API_URL, payload), daemon=True).start()
+            print(f"[GPS SENT] Latitude: {lat}, Longitude: {lng}")
+        time.sleep(1)
 
 # ---------- EAR CALC ----------
 def get_eye_aspect_ratio(landmarks, eye_indices):
@@ -88,100 +114,78 @@ def get_eye_aspect_ratio(landmarks, eye_indices):
 def read_gps_from_arduino():
     global GPS
     if not arduino:
+        print("[GPS] Arduino not connected, skipping GPS thread.")
         return
 
     while True:
         try:
-            if arduino.in_waiting > 0:
-                line = arduino.readline().decode('utf-8').strip()
-                if line.startswith("{") and line.endswith("}"):
+            line = arduino.readline().decode('utf-8').strip()
+            if line.startswith("{") and line.endswith("}"):
+                try:
                     data = json.loads(line)
                     with gps_lock:
-                        GPS.update({
-                            "lat": data.get("lat", GPS["lat"]),
-                            "lng": data.get("lng", GPS["lng"])
-                        })
-        except:
-            pass
+                        GPS["lat"] = data.get("lat", GPS["lat"])
+                        GPS["lng"] = data.get("lng", GPS["lng"])
+                        print(f"[GPS] Latitude: {GPS['lat']}, Longitude: {GPS['lng']}")
+                except json.JSONDecodeError:
+                    pass
+        except Exception as e:
+            print("[GPS ERR]", e)
         time.sleep(0.1)
 
 threading.Thread(target=read_gps_from_arduino, daemon=True).start()
+threading.Thread(target=send_gps_updates, daemon=True).start()
 
-# ---------- SIREN COMMAND POLLER ----------
+# ---------- SIREN POLLER ----------
 def poll_siren_api():
-    global siren_off_timer, is_drowsy
+    global siren_off_timer, is_drowsy, siren_initialized
 
     while True:
-        try:
-            res = requests.get(SIREN_API_URL, timeout=2)
-            cmds = res.json()
-
-            for cmd in cmds:
-                cid = cmd["_id"]
-                vid = cmd["vehicleId"]
-                action = cmd["command"]
-                ts = cmd.get("timestamp", 0)
-
-                # ------- FILTERS ----------
-                if vid != VEHICLE_ID:
+        res = safe_get(SIREN_API_URL)
+        if res:
+            try:
+                cmds = res.json()
+                if not siren_initialized:
+                    for cmd in cmds:
+                        processed_commands.add(cmd["_id"])
+                    siren_initialized = True
+                    time.sleep(1)
                     continue
 
-                if cmd.get("status") != "PENDING":
-                    continue
+                for cmd in cmds:
+                    cid = cmd["_id"]
+                    vid = cmd["vehicleId"]
+                    action = cmd["command"]
+                    if vid != VEHICLE_ID: continue
+                    if cmd.get("status") != "PENDING": continue
+                    if cid in processed_commands: continue
 
-                # ignore old commands (>5 sec)
-                if time.time() - ts > 5:
-                    continue
+                    processed_commands.add(cid)
+                    print(f"[SIREN] New Command: {action}")
 
-                if cid in processed_commands:
-                    continue
+                    if siren_off_timer and siren_off_timer.is_alive():
+                        siren_off_timer.cancel()
 
-                processed_commands.add(cid)
-                print(f"[SIREN] New Command: {action}")
-
-                # cancel old timer
-                if siren_off_timer and siren_off_timer.is_alive():
-                    siren_off_timer.cancel()
-
-                # ------- ACTIONS ----------
-                if action == "TRIGGER_ALARM":
-                    print("[SIREN] Alarm Triggered!")
-                    safe_serial_write(b'B')
-
-                    def auto_reset_alarm():
+                    if action == "TRIGGER_ALARM":
+                        safe_serial_write(b'B')
+                        siren_off_timer = threading.Timer(SIREN_DURATION, lambda: safe_serial_write(b'S'))
+                        siren_off_timer.start()
+                    elif action == "KILL_ENGINE":
+                        safe_serial_write(b'K')
+                        threading.Timer(1, lambda: safe_serial_write(b'S')).start()
+                    elif action == "RESET":
                         safe_serial_write(b'S')
-                        print("[SIREN] Alarm Auto Reset -> S sent")
+                        is_drowsy = False
 
-                    siren_off_timer = threading.Timer(SIREN_DURATION, auto_reset_alarm)
-                    siren_off_timer.start()
-
-                elif action == "KILL_ENGINE":
-                    print("[SIREN] Engine Kill ACTIVATED!")
-                    safe_serial_write(b'K')
-
-                    # auto reset after 1 sec
-                    def auto_reset_engine():
-                        safe_serial_write(b'S')
-                        print("[SIREN] Engine Auto Reset -> S sent")
-
-                    threading.Timer(1, auto_reset_engine).start()
-
-                elif action == "RESET":
-                    print("[SIREN] RESET COMMAND")
-                    safe_serial_write(b'S')
-                    is_drowsy = False
-
-            time.sleep(1)
-
-        except Exception:
-            time.sleep(1)
+            except Exception as e:
+                print("[SIREN ERR]", e)
+        time.sleep(1)
 
 threading.Thread(target=poll_siren_api, daemon=True).start()
 
 # ---------- MAIN LOOP ----------
 mp_face_mesh = mp.solutions.face_mesh
 face_mesh = mp_face_mesh.FaceMesh(max_num_faces=1, refine_landmarks=True)
-
 cap = cv2.VideoCapture(0)
 last_send_time = time.time()
 
@@ -189,19 +193,17 @@ print("[MAIN] FleetGuard AI running...")
 
 while True:
     ret, frame = cap.read()
-    if not ret:
-        break
+    if not ret: break
 
     frame = cv2.flip(frame, 1)
     rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
     results = face_mesh.process(rgb)
 
-    SPEED = 50
+    SPEED = 50  # or fetch from GPS if available
 
-    # ---------- DROWSINESS ----------
+    # DROWSINESS
     if results.multi_face_landmarks:
         lm = results.multi_face_landmarks[0].landmark
-        
         L = get_eye_aspect_ratio(lm, LEFT_EYE)
         R = get_eye_aspect_ratio(lm, RIGHT_EYE)
         EAR = (L + R) / 2
@@ -229,7 +231,7 @@ while True:
             cv2.putText(frame, "DROWSINESS ALERT!", (100, 300),
                         cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0,0,255), 3)
 
-    # ---------- HEARTBEAT ----------
+    # HEARTBEAT
     if time.time() - last_send_time > SEND_INTERVAL_SECONDS:
         with gps_lock:
             send_data("Sleeping" if is_drowsy else False, SPEED, dict(GPS))
